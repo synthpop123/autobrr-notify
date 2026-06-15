@@ -1,0 +1,28 @@
+# Example stack: the notifier next to autobrr. Copy .env.example to .env first.
+#
+# If you already run autobrr, delete the `autobrr` service below and attach
+# `autobrr-notify` to autobrr's network instead — autobrr only needs to reach it
+# in-network at http://autobrr-notify:8000/notify (see the README).
+services:
+  autobrr:
+    image: ghcr.io/autobrr/autobrr:latest
+    container_name: autobrr
+    restart: unless-stopped
+    environment:
+      - TZ=Etc/UTC
+    volumes:
+      - ./autobrr-config:/config
+    ports:
+      - "7474:7474/tcp"
+
+  autobrr-notify:
+    build: .
+    image: autobrr-notify
+    container_name: autobrr-notify
+    restart: unless-stopped
+    env_file: .env
+    # No host port required; autobrr reaches it over the compose network.
+
+networks:
+  default:
+    name: autobrr
