@@ -29,7 +29,6 @@ import requests
 from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 from requests.adapters import HTTPAdapter
-from tmdbv3api import Movie, Search, TMDb
 from urllib3.util.retry import Retry
 
 logging.basicConfig(
@@ -39,6 +38,7 @@ logging.basicConfig(
 log = logging.getLogger("autobrr-notify")
 
 TELEGRAM_API = "https://api.telegram.org"
+TMDB_API = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/original"
 
 # Field labels per language. The card content (title, overview, ...) follows
@@ -108,44 +108,43 @@ def _retrying_session() -> requests.Session:
 
 
 class MovieClient:
-    """TMDB lookups: resolve a release to a TMDB id, then fetch localized details."""
+    """TMDB lookups: resolve a release to a TMDB id, then fetch localized details.
+
+    Talks to the TMDB REST API through ONE pooled session. (tmdbv3api was dropped: it
+    ignores any injected session and lru-caches whole `requests.request` responses,
+    leaking a socket per call until the process hits its open-files limit.)
+    """
 
     def __init__(self, config: Config):
         self.config = config
-        self.tmdb = TMDb()
-        self.tmdb.api_key = config.tmdb_api_key
-        self.tmdb.language = config.tmdb_language
-        self.movie = Movie()
-        self.search = Search()
         self.session = _retrying_session()
-        self.movie.session = self.session
-        self.search.session = self.session
+
+    def _get(self, path: str, **params: Any) -> dict:
+        params["api_key"] = self.config.tmdb_api_key
+        resp = self.session.get(f"{TMDB_API}{path}", params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
 
     @lru_cache(maxsize=256)
-    def search_movie(self, title: str, year: Optional[str]) -> list[Any]:
-        return self.search.movies(title, year=year) if year else self.search.movies(title)
+    def search_movie(self, title: str, year: Optional[str]) -> list[dict]:
+        params: dict[str, Any] = {"query": title, "language": self.config.tmdb_language}
+        if year:
+            params["year"] = year
+        return self._get("/search/movie", **params).get("results") or []
 
     @lru_cache(maxsize=256)
     def find_by_imdb(self, imdb_id: str) -> Optional[dict]:
-        resp = self.session.get(
-            f"https://api.themoviedb.org/3/find/{imdb_id}",
-            params={"api_key": self.config.tmdb_api_key, "external_source": "imdb_id"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        results = resp.json().get("movie_results") or []
+        results = self._get(f"/find/{imdb_id}", external_source="imdb_id").get("movie_results") or []
         return results[0] if results else None
 
     @lru_cache(maxsize=256)
-    def details(self, tmdb_id: int, language: Optional[str] = None) -> Any:
+    def details(self, tmdb_id: int, language: Optional[str] = None) -> dict:
         """Movie details with credits + images, optionally in another language."""
-        if language and language != self.tmdb.language:
-            previous, self.tmdb.language = self.tmdb.language, language
-            try:
-                return self.movie.details(tmdb_id, append_to_response="credits,images")
-            finally:
-                self.tmdb.language = previous
-        return self.movie.details(tmdb_id, append_to_response="credits,images")
+        return self._get(
+            f"/movie/{tmdb_id}",
+            append_to_response="credits,images",
+            language=language or self.config.tmdb_language,
+        )
 
     def resolve_id(self, release: Release) -> Optional[int]:
         """Find a TMDB id from the IMDB id (if present) or a title+year search."""
@@ -155,7 +154,7 @@ class MovieClient:
                 return hit["id"]
             log.warning("IMDB id %s not found; falling back to title/year", release.meta_imdb)
         results = self.search_movie(release.parsed_title, release.release_year or None)
-        return results[0].id if results else None
+        return results[0]["id"] if results else None
 
 
 class MessageFormatter:
@@ -175,15 +174,15 @@ class MessageFormatter:
         return text
 
     @staticmethod
-    def names(people: list[Any], max_count: int = 3, job: Optional[str] = None) -> str:
+    def names(people: list[dict], max_count: int = 3, job: Optional[str] = None) -> str:
         """Up to `max_count` person names; if `job` is given, only matching crew."""
         out: list[str] = []
         for person in people:
             if len(out) >= max_count:
                 break
-            if job and getattr(person, "job", None) != job:
+            if job and person.get("job") != job:
                 continue
-            out.append(person.name)
+            out.append(person["name"])
         return ", ".join(out)
 
     def file_info(self, file_size: int, runtime: Optional[int]) -> tuple[str, str, str]:
@@ -283,19 +282,17 @@ def process_release(release: Release) -> None:
 
         localized = MOVIES.details(tmdb_id)
         english = MOVIES.details(tmdb_id, language="en-US")
-        credits = localized.credits
-        size, duration, bitrate = FORMATTER.file_info(
-            release.file_size, getattr(localized, "runtime", 0)
-        )
-        backdrop = getattr(english, "backdrop_path", None) or getattr(english, "poster_path", None)
-        imdb_id = getattr(localized, "imdb_id", None)
+        credits = localized.get("credits") or {}
+        size, duration, bitrate = FORMATTER.file_info(release.file_size, localized.get("runtime"))
+        backdrop = english.get("backdrop_path") or english.get("poster_path")
+        imdb_id = localized.get("imdb_id")
         data = {
-            "title": localized.title,
-            "year": (getattr(localized, "release_date", "") or "").split("-")[0] or release.release_year,
-            "overview": localized.overview or getattr(english, "overview", ""),
-            "genres": [genre.name for genre in localized.genres],
-            "director": FORMATTER.names(credits.crew, job="Director"),
-            "starring": FORMATTER.names(credits.cast),
+            "title": localized.get("title") or english.get("title") or release.parsed_title,
+            "year": (localized.get("release_date") or "").split("-")[0] or release.release_year,
+            "overview": localized.get("overview") or english.get("overview") or "",
+            "genres": [genre["name"] for genre in localized.get("genres") or []],
+            "director": FORMATTER.names(credits.get("crew") or [], job="Director"),
+            "starring": FORMATTER.names(credits.get("cast") or []),
             "size": size,
             "duration": duration,
             "bitrate": bitrate,
